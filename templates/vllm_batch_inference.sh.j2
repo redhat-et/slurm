@@ -1,0 +1,108 @@
+#!/bin/bash
+#SBATCH --job-name=vllm-batch-{{ item.name }}
+#SBATCH --output=/home/{{ slurm_user }}/vllm-jobs/outputs/batch_{{ item.name }}_%j.out
+#SBATCH --error=/home/{{ slurm_user }}/vllm-jobs/outputs/batch_{{ item.name }}_%j.err
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:1
+#SBATCH --time=01:00:00
+#SBATCH --partition=gpu
+
+echo "=========================================="
+echo "vLLM Batch Inference: {{ item.name | upper }}"
+echo "=========================================="
+echo "Job ID: $SLURM_JOB_ID"
+echo "Node: $SLURMD_NODENAME"
+echo "Model: {{ item.model_id }}"
+echo "Start time: $(date)"
+echo ""
+
+# Environment setup
+export HF_HOME={{ model_cache_dir }}
+export CUDA_VISIBLE_DEVICES=0
+
+# Display GPU info
+echo "GPU Information:"
+nvidia-smi
+echo ""
+
+# Create test prompts
+cat > /tmp/test_prompts_${SLURM_JOB_ID}.txt <<'EOF'
+Explain quantum computing in simple terms.
+Write a Python function to calculate fibonacci numbers.
+What are the main differences between supervised and unsupervised learning?
+Describe the water cycle.
+What is the capital of France and what is it known for?
+EOF
+
+echo "Running batch inference..."
+echo "Prompts:"
+cat /tmp/test_prompts_${SLURM_JOB_ID}.txt
+echo ""
+echo "=========================================="
+echo "Results:"
+echo "=========================================="
+echo ""
+
+# Run batch inference using Python
+python3 <<PYTHON_EOF
+from vllm import LLM, SamplingParams
+import os
+
+# Set environment
+os.environ['HF_HOME'] = '{{ model_cache_dir }}'
+
+# Initialize model
+print("Loading model {{ item.model_id }}...")
+llm = LLM(
+    model="{{ item.model_id }}",
+    dtype="{{ vllm_default_dtype }}",
+    max_model_len={{ item.max_model_len }},
+    gpu_memory_utilization={{ item.gpu_memory_utilization }},
+    tensor_parallel_size={{ vllm_default_tensor_parallel }},
+    trust_remote_code=True
+)
+
+# Load prompts
+with open('/tmp/test_prompts_${SLURM_JOB_ID}.txt', 'r') as f:
+    prompts = [line.strip() for line in f if line.strip()]
+
+# Sampling parameters
+sampling_params = SamplingParams(
+    temperature=0.7,
+    top_p=0.9,
+    max_tokens=256
+)
+
+print(f"Running inference on {len(prompts)} prompts...\n")
+
+# Generate
+outputs = llm.generate(prompts, sampling_params)
+
+# Display results
+for i, output in enumerate(outputs, 1):
+    prompt = output.prompt
+    generated_text = output.outputs[0].text
+    print(f"{'='*60}")
+    print(f"Prompt {i}: {prompt}")
+    print(f"{'-'*60}")
+    print(f"Response: {generated_text}")
+    print(f"{'='*60}\n")
+
+# Save results
+output_file = f'/home/{{ slurm_user }}/vllm-jobs/outputs/batch_{{ item.name }}_${SLURM_JOB_ID}_results.txt'
+with open(output_file, 'w') as f:
+    for i, output in enumerate(outputs, 1):
+        f.write(f"Prompt {i}: {output.prompt}\n")
+        f.write(f"Response: {output.outputs[0].text}\n")
+        f.write(f"{'='*80}\n\n")
+
+print(f"Results saved to: {output_file}")
+PYTHON_EOF
+
+# Cleanup
+rm -f /tmp/test_prompts_${SLURM_JOB_ID}.txt
+
+echo ""
+echo "End time: $(date)"
+echo "Batch inference completed successfully!"

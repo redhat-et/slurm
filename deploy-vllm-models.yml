@@ -1,0 +1,438 @@
+---
+- name: Deploy vLLM Models on Slurm Cluster
+  hosts: slurm_cluster
+  become: true
+  vars_files:
+    - group_vars/all.yml
+    - group_vars/vllm.yml
+  tasks:
+    - name: Install Python development packages
+      dnf:
+        name:
+          - python3
+          - python3-pip
+          - python3-devel
+        state: present
+
+    - name: Create vLLM directory
+      file:
+        path: "{{ vllm_install_dir }}"
+        state: directory
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+        mode: '0755'
+
+    - name: Create model cache directory
+      file:
+        path: "{{ model_cache_dir }}"
+        state: directory
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+        mode: '0755'
+
+    - name: Create vLLM logs directory
+      file:
+        path: /var/log/vllm
+        state: directory
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+        mode: '0755'
+
+    - name: Install vLLM system-wide
+      pip:
+        name:
+          - vllm
+          - huggingface_hub
+          - accelerate
+          - transformers
+        executable: pip3
+      environment:
+        CUDA_HOME: /usr/local/cuda
+        PATH: "/usr/local/cuda/bin:{{ ansible_env.PATH }}"
+
+    - name: Set HuggingFace cache directory
+      lineinfile:
+        path: "/home/{{ slurm_user }}/.bashrc"
+        line: "export HF_HOME={{ model_cache_dir }}"
+        create: true
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+
+- name: Pre-download Models on Compute Nodes
+  hosts: slurm_compute
+  become: true
+  vars_files:
+    - group_vars/all.yml
+    - group_vars/vllm.yml
+  tasks:
+    - name: Create Python script to download models
+      copy:
+        content: |
+          #!/usr/bin/env python3
+          import os
+          from huggingface_hub import snapshot_download
+
+          models = {{ vllm_models | to_json }}
+          cache_dir = "{{ model_cache_dir }}"
+
+          os.environ['HF_HOME'] = cache_dir
+
+          for model in models:
+              model_id = model['model_id']
+              print(f"Downloading {model_id}...")
+              try:
+                  snapshot_download(
+                      repo_id=model_id,
+                      cache_dir=cache_dir,
+                      resume_download=True,
+                      max_workers=4
+                  )
+                  print(f"Successfully downloaded {model_id}")
+              except Exception as e:
+                  print(f"Error downloading {model_id}: {e}")
+        dest: /tmp/download_models.py
+        mode: '0755'
+
+    - name: Download model weights
+      command: python3 /tmp/download_models.py
+      environment:
+        HF_HOME: "{{ model_cache_dir }}"
+        HF_HUB_ENABLE_HF_TRANSFER: "1"
+      async: 3600
+      poll: 30
+      register: download_result
+
+    - name: Set model directory ownership
+      file:
+        path: "{{ model_cache_dir }}"
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+        recurse: true
+
+    - name: Display download status
+      debug:
+        msg: "Model download completed on {{ inventory_hostname }}"
+
+- name: Create vLLM Slurm Job Scripts
+  hosts: slurm_controller
+  become: true
+  vars_files:
+    - group_vars/all.yml
+    - group_vars/vllm.yml
+  tasks:
+    - name: Create vLLM jobs directory
+      file:
+        path: "/home/{{ slurm_user }}/vllm-jobs"
+        state: directory
+        mode: '0755'
+
+    - name: Create vLLM output directory
+      file:
+        path: "/home/{{ slurm_user }}/vllm-jobs/outputs"
+        state: directory
+        mode: '0755'
+
+    - name: Deploy vLLM model serving scripts
+      template:
+        src: "templates/vllm_serve_model.sh.j2"
+        dest: "/home/{{ slurm_user }}/vllm-jobs/serve_{{ item.name }}.sh"
+        mode: '0755'
+      loop: "{{ vllm_models }}"
+
+    - name: Deploy vLLM batch inference scripts
+      template:
+        src: "templates/vllm_batch_inference.sh.j2"
+        dest: "/home/{{ slurm_user }}/vllm-jobs/batch_{{ item.name }}.sh"
+        mode: '0755'
+      loop: "{{ vllm_models }}"
+
+    - name: Deploy vLLM inference test script
+      template:
+        src: "templates/vllm_test_inference.py.j2"
+        dest: "/home/{{ slurm_user }}/vllm-jobs/test_inference.py"
+        mode: '0755'
+
+    - name: Create model submission helper script
+      copy:
+        content: |
+          #!/bin/bash
+          # vLLM Model Management Script
+
+          JOBS_DIR="/home/{{ slurm_user }}/vllm-jobs"
+
+          show_usage() {
+              echo "Usage: $0 {serve|batch|list|cancel} [model_name]"
+              echo ""
+              echo "Models available:"
+          {% for model in vllm_models %}
+              echo "  - {{ model.name }}"
+          {% endfor %}
+              echo ""
+              echo "Commands:"
+              echo "  serve <model_name>  - Start vLLM serving for a model"
+              echo "  batch <model_name>  - Run batch inference for a model"
+              echo "  list                - List all running vLLM jobs"
+              echo "  cancel <job_id>     - Cancel a specific job"
+              echo ""
+              echo "Examples:"
+              echo "  $0 serve phi3"
+              echo "  $0 batch mistral"
+              echo "  $0 list"
+          }
+
+          list_jobs() {
+              echo "Running vLLM jobs:"
+              squeue -u {{ slurm_user }} -o "%.18i %.9P %.30j %.8u %.8T %.10M %.6D %R"
+          }
+
+          serve_model() {
+              local model=$1
+              if [ -f "$JOBS_DIR/serve_${model}.sh" ]; then
+                  echo "Submitting vLLM serving job for $model..."
+                  sbatch "$JOBS_DIR/serve_${model}.sh"
+              else
+                  echo "Error: Model $model not found"
+                  show_usage
+                  exit 1
+              fi
+          }
+
+          batch_inference() {
+              local model=$1
+              if [ -f "$JOBS_DIR/batch_${model}.sh" ]; then
+                  echo "Submitting batch inference job for $model..."
+                  sbatch "$JOBS_DIR/batch_${model}.sh"
+              else
+                  echo "Error: Model $model not found"
+                  show_usage
+                  exit 1
+              fi
+          }
+
+          cancel_job() {
+              local job_id=$1
+              echo "Canceling job $job_id..."
+              scancel "$job_id"
+          }
+
+          case "$1" in
+              serve)
+                  if [ -z "$2" ]; then
+                      echo "Error: Model name required"
+                      show_usage
+                      exit 1
+                  fi
+                  serve_model "$2"
+                  ;;
+              batch)
+                  if [ -z "$2" ]; then
+                      echo "Error: Model name required"
+                      show_usage
+                      exit 1
+                  fi
+                  batch_inference "$2"
+                  ;;
+              list)
+                  list_jobs
+                  ;;
+              cancel)
+                  if [ -z "$2" ]; then
+                      echo "Error: Job ID required"
+                      show_usage
+                      exit 1
+                  fi
+                  cancel_job "$2"
+                  ;;
+              *)
+                  show_usage
+                  exit 1
+                  ;;
+          esac
+        dest: "/home/{{ slurm_user }}/vllm-jobs/vllm-manager.sh"
+        mode: '0755'
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+
+    - name: Set ownership of vLLM jobs directory
+      file:
+        path: "/home/{{ slurm_user }}/vllm-jobs"
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+        recurse: true
+        state: directory
+
+    - name: Create README for vLLM jobs
+      copy:
+        content: |
+          # vLLM Model Deployment on Slurm
+
+          This directory contains scripts for running vLLM model inference on the Slurm cluster.
+
+          ## Available Models
+
+          {% for model in vllm_models %}
+          ### {{ loop.index }}. {{ model.name | upper }}
+          - **Model ID**: {{ model.model_id }}
+          - **Description**: {{ model.description }}
+          - **Context Length**: {{ model.context_length }} tokens
+          - **Recommended Use**: {{ model.use_case }}
+
+          {% endfor %}
+
+          ## Quick Start
+
+          ### Using the Management Script
+
+          ```bash
+          # Serve a model (API endpoint)
+          ./vllm-manager.sh serve phi3
+          ./vllm-manager.sh serve mistral
+          ./vllm-manager.sh serve llama3
+
+          # Run batch inference
+          ./vllm-manager.sh batch phi3
+
+          # List running jobs
+          ./vllm-manager.sh list
+
+          # Cancel a job
+          ./vllm-manager.sh cancel <job_id>
+          ```
+
+          ### Manual Submission
+
+          ```bash
+          # Serve models
+          sbatch serve_phi3.sh
+          sbatch serve_mistral.sh
+          sbatch serve_llama3.sh
+
+          # Batch inference
+          sbatch batch_phi3.sh
+          sbatch batch_mistral.sh
+          sbatch batch_llama3.sh
+          ```
+
+          ## Model Serving
+
+          When you submit a serving job, vLLM will start an OpenAI-compatible API server.
+
+          ### Connecting to a Served Model
+
+          Once the job is running, find the node:
+          ```bash
+          squeue -u $USER
+          ```
+
+          Then connect to the API (from the same node or controller):
+          ```bash
+          # Find the node where the job is running
+          NODE=$(squeue -u $USER -h -o "%N" | head -1)
+          PORT=8000  # Default vLLM port
+
+          # Test the API
+          curl http://$NODE:$PORT/v1/models
+
+          # Generate text
+          curl http://$NODE:$PORT/v1/completions \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "model",
+              "prompt": "Hello, how are you?",
+              "max_tokens": 50
+            }'
+          ```
+
+          ## Batch Inference
+
+          Batch inference jobs run a set of prompts and save results to files.
+
+          Output location: `outputs/`
+
+          ## Monitoring
+
+          ```bash
+          # Watch queue
+          watch -n 1 squeue -u $USER
+
+          # View job output
+          tail -f outputs/serve_phi3_<jobid>.out
+
+          # Check GPU usage on compute node
+          ssh slurm-node-1 nvidia-smi
+          ```
+
+          ## Troubleshooting
+
+          ### Model not loading
+          - Check if model was downloaded: `ls -lh {{ model_cache_dir }}/models--*`
+          - Check GPU memory: `nvidia-smi`
+          - Review job logs in `outputs/`
+
+          ### Out of GPU memory
+          - Reduce `--max-model-len`
+          - Reduce `--gpu-memory-utilization`
+          - Use a smaller model
+
+          ### Job pending
+          - Check available resources: `sinfo`
+          - Check job priority: `sprio`
+          - View reason: `squeue -u $USER -o "%.18i %.9P %.30j %.8u %.8T %.10M %.9l %.6D %R"`
+
+          ## Advanced Usage
+
+          ### Custom Inference Parameters
+
+          Edit the job scripts to modify:
+          - `--max-model-len`: Maximum context length
+          - `--gpu-memory-utilization`: GPU memory to use (0.0-1.0)
+          - `--tensor-parallel-size`: Number of GPUs for tensor parallelism
+          - `--dtype`: Model precision (auto, half, float16, bfloat16)
+
+          ### Running All Models Simultaneously
+
+          ```bash
+          # Submit all serving jobs
+          for model in phi3 mistral llama3; do
+              ./vllm-manager.sh serve $model
+          done
+
+          # Check status
+          ./vllm-manager.sh list
+          ```
+
+          ## Performance Tips
+
+          1. **GPU Memory**: Monitor with `nvidia-smi` and adjust `--gpu-memory-utilization`
+          2. **Batch Size**: Larger batches = better throughput but more memory
+          3. **Quantization**: Consider using quantized models for larger models
+          4. **Context Length**: Reduce `--max-model-len` if you don't need long contexts
+
+          ## API Documentation
+
+          vLLM provides an OpenAI-compatible API. See:
+          - https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html
+
+          ## Model Information
+
+          Models are cached in: `{{ model_cache_dir }}`
+
+          To re-download models, remove the cache directory and re-run the playbook.
+        dest: "/home/{{ slurm_user }}/vllm-jobs/README.md"
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+
+    - name: Display deployment summary
+      debug:
+        msg:
+          - "✅ vLLM deployment complete!"
+          - ""
+          - "Models installed: phi3, mistral, llama3"
+          - ""
+          - "Location: /home/{{ slurm_user }}/vllm-jobs/"
+          - ""
+          - "Quick start:"
+          - "  cd ~/vllm-jobs"
+          - "  ./vllm-manager.sh serve phi3"
+          - ""
+          - "See ~/vllm-jobs/README.md for full documentation"

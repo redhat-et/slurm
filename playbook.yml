@@ -1,0 +1,609 @@
+---
+- name: Create AWS Infrastructure for Slurm Cluster
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Create VPC
+      amazon.aws.ec2_vpc_net:
+        name: "{{ vpc_name }}"
+        cidr_block: "{{ vpc_cidr }}"
+        region: "{{ aws_region }}"
+        dns_support: true
+        dns_hostnames: true
+        tags:
+          Name: "{{ vpc_name }}"
+          Project: slurm-cluster
+      register: vpc
+
+    - name: Create Internet Gateway
+      amazon.aws.ec2_vpc_igw:
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ aws_region }}"
+        tags:
+          Name: "{{ vpc_name }}-igw"
+          Project: slurm-cluster
+      register: igw
+
+    - name: Create Subnet
+      amazon.aws.ec2_vpc_subnet:
+        vpc_id: "{{ vpc.vpc.id }}"
+        cidr: "{{ subnet_cidr }}"
+        az: "{{ availability_zone }}"
+        region: "{{ aws_region }}"
+        map_public: true
+        tags:
+          Name: "{{ vpc_name }}-subnet"
+          Project: slurm-cluster
+      register: subnet
+
+    - name: Create Route Table
+      amazon.aws.ec2_vpc_route_table:
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ aws_region }}"
+        subnets:
+          - "{{ subnet.subnet.id }}"
+        routes:
+          - dest: 0.0.0.0/0
+            gateway_id: "{{ igw.gateway_id }}"
+        tags:
+          Name: "{{ vpc_name }}-rt"
+          Project: slurm-cluster
+
+    - name: Create Wide Open Security Group
+      amazon.aws.ec2_security_group:
+        name: "{{ vpc_name }}-sg"
+        description: "Wide open security group for Slurm cluster (NOT FOR PRODUCTION)"
+        vpc_id: "{{ vpc.vpc.id }}"
+        region: "{{ aws_region }}"
+        rules:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+        tags:
+          Name: "{{ vpc_name }}-sg"
+          Project: slurm-cluster
+      register: security_group
+
+    - name: Find latest RHEL 10 AMI
+      amazon.aws.ec2_ami_info:
+        region: "{{ aws_region }}"
+        owners: "{{ ami_owner }}"
+        filters:
+          name: "{{ ami_name }}"
+          architecture: x86_64
+          state: available
+      register: ami_info
+
+    - name: Set AMI ID
+      set_fact:
+        ami_id: "{{ (ami_info.images | sort(attribute='creation_date') | last).image_id }}"
+
+    - name: Launch EC2 Instances
+      amazon.aws.ec2_instance:
+        name: "slurm-node-{{ item }}"
+        region: "{{ aws_region }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ ami_id }}"
+        key_name: "{{ key_name }}"
+        network_interfaces:
+          - assign_public_ip: true
+            device_index: 0
+            subnet_id: "{{ subnet.subnet.id }}"
+            groups:
+              - "{{ security_group.group_id }}"
+        volumes:
+          - device_name: /dev/sda1
+            ebs:
+              volume_size: "{{ volume_size }}"
+              volume_type: gp3
+              delete_on_termination: true
+        tags:
+          Name: "slurm-node-{{ item }}"
+          Project: slurm-cluster
+          Role: "{{ 'controller' if item == 0 else 'compute' }}"
+          Index: "{{ item }}"
+        wait: true
+        state: running
+      register: ec2_instances
+      loop: "{{ range(0, instance_count) | list }}"
+
+    - name: Wait for SSH to be available
+      wait_for:
+        host: "{{ item.instances[0].public_ip_address }}"
+        port: 22
+        delay: 10
+        timeout: 320
+        state: started
+      loop: "{{ ec2_instances.results }}"
+
+    - name: Add instances to inventory
+      add_host:
+        name: "{{ item.instances[0].public_ip_address }}"
+        groups:
+          - slurm_cluster
+          - "{{ 'slurm_controller' if item.item == 0 else 'slurm_compute' }}"
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "~/.ssh/id_rsa"
+        private_ip: "{{ item.instances[0].private_ip_address }}"
+        public_ip: "{{ item.instances[0].public_ip_address }}"
+        node_index: "{{ item.item }}"
+        node_name: "slurm-node-{{ item.item }}"
+      loop: "{{ ec2_instances.results }}"
+
+    - name: Save inventory to file
+      copy:
+        content: |
+          [slurm_controller]
+          {{ ec2_instances.results[0].instances[0].public_ip_address }} private_ip={{ ec2_instances.results[0].instances[0].private_ip_address }} node_name=slurm-node-0
+
+          [slurm_compute]
+          {% for i in range(1, instance_count) %}
+          {{ ec2_instances.results[i].instances[0].public_ip_address }} private_ip={{ ec2_instances.results[i].instances[0].private_ip_address }} node_name=slurm-node-{{ i }}
+          {% endfor %}
+
+          [slurm_cluster:children]
+          slurm_controller
+          slurm_compute
+
+          [slurm_cluster:vars]
+          ansible_user=ec2-user
+          ansible_ssh_private_key_file=~/.ssh/id_rsa
+        dest: ./inventory/hosts
+
+    - name: Display instance information
+      debug:
+        msg:
+          - "Slurm cluster instances created successfully!"
+          - "Controller Node: {{ ec2_instances.results[0].instances[0].public_ip_address }}"
+          - "Compute Nodes:"
+          - "  - Node 1: {{ ec2_instances.results[1].instances[0].public_ip_address }}"
+          - "  - Node 2: {{ ec2_instances.results[2].instances[0].public_ip_address }}"
+          - ""
+          - "Run the following command to configure the cluster:"
+          - "ansible-playbook configure-cluster.yml"
+
+- name: Configure Slurm Cluster Nodes
+  hosts: slurm_cluster
+  become: true
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Set hostname
+      hostname:
+        name: "{{ node_name }}"
+
+    - name: Update /etc/hosts with all nodes
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[item].private_ip }} {{ hostvars[item].node_name }}"
+        state: present
+      loop: "{{ groups['slurm_cluster'] }}"
+
+    - name: Update system packages
+      dnf:
+        name: "*"
+        state: latest
+        update_cache: true
+
+    - name: Enable CodeReady Builder repository
+      shell: subscription-manager repos --enable codeready-builder-for-rhel-10-$(uname -i)-rpms
+
+    - name: Install EPEL repository
+      dnf:
+        name: https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
+        state: present
+        disable_gpg_check: true
+
+    - name: Install build dependencies and tools
+      dnf:
+        name:
+          - wget
+          - kernel-devel
+          - kernel-headers
+          - gcc
+          - make
+          - dkms
+          - acpid
+          - libglvnd-glx
+          - libglvnd-opengl
+          - libglvnd-devel
+          - pkgconfig
+          - pciutils
+        state: present
+
+    - name: Download NVIDIA driver repository package
+      get_url:
+        url: "https://developer.download.nvidia.com/compute/nvidia-driver/{{ nvidia_driver_version }}/local_installers/nvidia-driver-local-repo-rhel10-{{ nvidia_driver_version }}-1.0-1.x86_64.rpm"
+        dest: "/tmp/nvidia-driver-local-repo-rhel10-{{ nvidia_driver_version }}-1.0-1.x86_64.rpm"
+
+    - name: Install NVIDIA driver repository
+      dnf:
+        name: "/tmp/nvidia-driver-local-repo-rhel10-{{ nvidia_driver_version }}-1.0-1.x86_64.rpm"
+        state: present
+        disable_gpg_check: true
+
+    - name: Clean DNF cache
+      command: dnf clean all
+
+    - name: Install NVIDIA driver
+      dnf:
+        name: "{{ nvidia_driver_package }}"
+        state: present
+
+    - name: Install NVIDIA Container Toolkit repository
+      shell: |
+        curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+      args:
+        creates: /etc/yum.repos.d/nvidia-container-toolkit.repo
+
+    - name: Install NVIDIA Container Toolkit
+      dnf:
+        name: nvidia-container-toolkit
+        state: present
+
+    - name: Ensure CDI directory exists
+      file:
+        path: /etc/cdi
+        state: directory
+        mode: '0755'
+
+    - name: Install Podman
+      dnf:
+        name: podman
+        state: present
+
+    - name: Reboot to load NVIDIA drivers
+      reboot:
+        reboot_timeout: 600
+      when: ansible_facts['os_family'] == "RedHat"
+
+- name: Generate CDI Configuration (Post-Reboot)
+  hosts: slurm_cluster
+  become: true
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Wait for system to be ready
+      wait_for_connection:
+        timeout: 300
+        delay: 10
+
+    - name: Verify NVIDIA driver is loaded
+      command: nvidia-smi
+      register: nvidia_check
+      failed_when: false
+      changed_when: false
+
+    - name: Display NVIDIA driver status
+      debug:
+        msg: "NVIDIA driver loaded: {{ 'Yes' if nvidia_check.rc == 0 else 'No' }}"
+
+    - name: Generate CDI configuration
+      command: nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+      when: nvidia_check.rc == 0
+
+    - name: Fail if NVIDIA driver not loaded
+      fail:
+        msg: "NVIDIA driver is not loaded. Please check driver installation."
+      when: nvidia_check.rc != 0
+
+- name: Install and Configure Slurm
+  hosts: slurm_cluster
+  become: true
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Create Slurm group
+      group:
+        name: "{{ slurm_user }}"
+        gid: "{{ slurm_gid }}"
+        state: present
+
+    - name: Create Slurm user
+      user:
+        name: "{{ slurm_user }}"
+        uid: "{{ slurm_uid }}"
+        group: "{{ slurm_user }}"
+        shell: /bin/bash
+        create_home: true
+        state: present
+
+    - name: Install Slurm dependencies (core packages)
+      dnf:
+        name:
+          - munge
+          - munge-libs
+          - mariadb-server
+          - mariadb-devel
+          - python3-devel
+          - python3-pip
+          - hwloc
+          - hwloc-devel
+          - lua
+          - readline-devel
+          - pam-devel
+          - perl
+          - perl-ExtUtils-MakeMaker
+          - openssl
+          - openssl-devel
+          - numactl
+          - numactl-devel
+          - ncurses-devel
+          - rpm-build
+          - json-c-devel
+          - dbus-devel
+        state: present
+
+    - name: Install Slurm dependencies (optional packages)
+      dnf:
+        name:
+          - munge-devel
+          - lua-devel
+          - gtk2-devel
+          - libibmad
+          - libibumad
+          - libyaml-devel
+        state: present
+      ignore_errors: true
+
+    - name: Download Slurm source
+      get_url:
+        url: "https://download.schedmd.com/slurm/slurm-{{ slurm_version }}.tar.bz2"
+        dest: "/tmp/slurm-{{ slurm_version }}.tar.bz2"
+
+    - name: Extract Slurm source
+      unarchive:
+        src: "/tmp/slurm-{{ slurm_version }}.tar.bz2"
+        dest: /tmp
+        remote_src: true
+
+    - name: Download NVML header for GPU support
+      shell: |
+        curl -f -L -o /usr/include/nvml.h https://raw.githubusercontent.com/NVIDIA/cuda-samples/v12.3/Common/nvml.h || curl -f -L -o /usr/include/nvml.h https://raw.githubusercontent.com/NVIDIA/gpu-monitoring-tools/master/bindings/go/nvml/nvml.h || echo "Warning: Could not download nvml.h"
+        chmod 644 /usr/include/nvml.h 2>/dev/null || true
+      args:
+        creates: /usr/include/nvml.h
+
+    - name: Create symlink for NVIDIA library
+      file:
+        src: /usr/lib64/libnvidia-ml.so.1
+        dest: /usr/lib64/libnvidia-ml.so
+        state: link
+
+    - name: Configure Slurm build with GPU support
+      command: ./configure --prefix=/usr --sysconfdir=/etc/slurm --with-hwloc=/usr --enable-pam --with-nvml=/usr
+      args:
+        chdir: "/tmp/slurm-{{ slurm_version }}"
+        creates: "/tmp/slurm-{{ slurm_version }}/Makefile"
+
+    - name: Build Slurm
+      make:
+        chdir: "/tmp/slurm-{{ slurm_version }}"
+        params:
+          NUM_THREADS: 4
+
+    - name: Install Slurm
+      make:
+        chdir: "/tmp/slurm-{{ slurm_version }}"
+        target: install
+
+    - name: Create Slurm directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+        mode: '0755'
+      loop:
+        - /etc/slurm
+        - /var/spool/slurm
+        - /var/spool/slurm/ctld
+        - /var/spool/slurm/d
+        - /var/log/slurm
+
+- name: Configure Munge (All Nodes)
+  hosts: slurm_cluster
+  become: true
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Generate Munge key on controller
+      command: /usr/sbin/create-munge-key
+      args:
+        creates: /etc/munge/munge.key
+      when: "'slurm_controller' in group_names"
+
+    - name: Fetch Munge key from controller
+      fetch:
+        src: /etc/munge/munge.key
+        dest: /tmp/munge.key
+        flat: true
+      when: "'slurm_controller' in group_names"
+
+    - name: Copy Munge key to compute nodes
+      copy:
+        src: /tmp/munge.key
+        dest: /etc/munge/munge.key
+        owner: munge
+        group: munge
+        mode: '0400'
+      when: "'slurm_compute' in group_names"
+
+    - name: Set Munge key permissions on controller
+      file:
+        path: /etc/munge/munge.key
+        owner: munge
+        group: munge
+        mode: '0400'
+      when: "'slurm_controller' in group_names"
+
+    - name: Enable and start Munge service
+      systemd:
+        name: munge
+        enabled: true
+        state: restarted
+
+- name: Configure Slurm Controller
+  hosts: slurm_controller
+  become: true
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Deploy slurm.conf
+      template:
+        src: templates/slurm.conf.j2
+        dest: /etc/slurm/slurm.conf
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+        mode: '0644'
+
+    - name: Deploy slurmdbd.conf
+      template:
+        src: templates/slurmdbd.conf.j2
+        dest: /etc/slurm/slurmdbd.conf
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+        mode: '0600'
+
+    - name: Deploy cgroup.conf
+      template:
+        src: templates/cgroup.conf.j2
+        dest: /etc/slurm/cgroup.conf
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+        mode: '0644'
+
+    - name: Deploy gres.conf for GPU support
+      template:
+        src: templates/gres.conf.j2
+        dest: /etc/slurm/gres.conf
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+        mode: '0644'
+
+    - name: Start and enable MariaDB
+      systemd:
+        name: mariadb
+        enabled: true
+        state: started
+
+    - name: Create Slurm database
+      mysql_db:
+        name: slurm_acct_db
+        state: present
+
+    - name: Create Slurm database user
+      mysql_user:
+        name: slurm
+        password: "{{ slurm_db_password }}"
+        priv: "slurm_acct_db.*:ALL"
+        state: present
+
+    - name: Deploy slurmctld systemd service
+      copy:
+        src: "/tmp/slurm-{{ slurm_version }}/etc/slurmctld.service"
+        dest: /etc/systemd/system/slurmctld.service
+        remote_src: true
+
+    - name: Fix slurmctld service to run as root
+      lineinfile:
+        path: /etc/systemd/system/slurmctld.service
+        regexp: '^(User|Group)='
+        state: absent
+
+    - name: Deploy slurmdbd systemd service
+      copy:
+        src: "/tmp/slurm-{{ slurm_version }}/etc/slurmdbd.service"
+        dest: /etc/systemd/system/slurmdbd.service
+        remote_src: true
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: true
+
+    - name: Enable and start slurmdbd
+      systemd:
+        name: slurmdbd
+        enabled: true
+        state: restarted
+
+    - name: Enable and start slurmctld
+      systemd:
+        name: slurmctld
+        enabled: true
+        state: restarted
+
+- name: Configure Slurm Compute Nodes
+  hosts: slurm_compute
+  become: true
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Copy slurm.conf from controller
+      copy:
+        src: /etc/slurm/slurm.conf
+        dest: /etc/slurm/slurm.conf
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+        mode: '0644'
+      delegate_to: "{{ groups['slurm_controller'][0] }}"
+
+    - name: Copy cgroup.conf from controller
+      copy:
+        src: /etc/slurm/cgroup.conf
+        dest: /etc/slurm/cgroup.conf
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+        mode: '0644'
+      delegate_to: "{{ groups['slurm_controller'][0] }}"
+
+    - name: Copy gres.conf from controller
+      copy:
+        src: /etc/slurm/gres.conf
+        dest: /etc/slurm/gres.conf
+        owner: "{{ slurm_user }}"
+        group: "{{ slurm_user }}"
+        mode: '0644'
+      delegate_to: "{{ groups['slurm_controller'][0] }}"
+
+    - name: Deploy slurmd systemd service
+      copy:
+        src: "/tmp/slurm-{{ slurm_version }}/etc/slurmd.service"
+        dest: /etc/systemd/system/slurmd.service
+        remote_src: true
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: true
+
+    - name: Enable and start slurmd
+      systemd:
+        name: slurmd
+        enabled: true
+        state: restarted
+
+- name: Verify Slurm Cluster
+  hosts: slurm_controller
+  become: true
+  vars_files:
+    - group_vars/all.yml
+  tasks:
+    - name: Check cluster status
+      command: sinfo
+      register: sinfo_output
+
+    - name: Display cluster status
+      debug:
+        var: sinfo_output.stdout_lines
+
+    - name: Check node status
+      command: scontrol show nodes
+      register: nodes_output
+
+    - name: Display node details
+      debug:
+        var: nodes_output.stdout_lines

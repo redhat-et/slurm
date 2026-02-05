@@ -1,0 +1,54 @@
+#!/bin/bash
+#SBATCH --job-name=vllm-serve-{{ item.name }}
+#SBATCH --output=/home/{{ slurm_user }}/vllm-jobs/outputs/serve_{{ item.name }}_%j.out
+#SBATCH --error=/home/{{ slurm_user }}/vllm-jobs/outputs/serve_{{ item.name }}_%j.err
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:1
+#SBATCH --time=12:00:00
+#SBATCH --partition=gpu
+
+echo "=========================================="
+echo "vLLM Model Serving: {{ item.name | upper }}"
+echo "=========================================="
+echo "Job ID: $SLURM_JOB_ID"
+echo "Node: $SLURMD_NODENAME"
+echo "Model: {{ item.model_id }}"
+echo "Start time: $(date)"
+echo ""
+
+# Environment setup
+export HF_HOME={{ model_cache_dir }}
+export CUDA_VISIBLE_DEVICES=0
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+# Display GPU info
+echo "GPU Information:"
+nvidia-smi -L
+echo ""
+
+# Display model cache
+echo "Model cache directory:"
+ls -lh {{ model_cache_dir }}/models--$(echo "{{ item.model_id }}" | sed 's/\//*/')* 2>/dev/null || echo "Model not yet cached"
+echo ""
+
+echo "Starting vLLM server..."
+echo "API will be available at: http://$SLURMD_NODENAME:{{ item.port }}"
+echo "Logs will be written to: $SLURM_SUBMIT_DIR/outputs/serve_{{ item.name }}_${SLURM_JOB_ID}.out"
+echo ""
+
+# Start vLLM server
+python3 -m vllm.entrypoints.openai.api_server \
+    --model {{ item.model_id }} \
+    --host 0.0.0.0 \
+    --port {{ item.port }} \
+    --dtype {{ vllm_default_dtype }} \
+    --max-model-len {{ item.max_model_len }} \
+    --gpu-memory-utilization {{ item.gpu_memory_utilization }} \
+    --tensor-parallel-size {{ vllm_default_tensor_parallel }} \
+    --trust-remote-code \
+    --disable-log-requests
+
+# This will run until the job is cancelled or time limit is reached
+echo ""
+echo "vLLM server stopped at $(date)"

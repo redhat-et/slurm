@@ -1,0 +1,10 @@
+*.pem
+*.key
+inventory/hosts
+*.retry
+.ansible/
+__pycache__/
+*.pyc
+.env
+/tmp/
+*.log

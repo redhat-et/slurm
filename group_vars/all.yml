@@ -1,0 +1,31 @@
+---
+# AWS Configuration
+aws_region: us-east-1
+vpc_name: slurm-cluster-vpc
+vpc_cidr: 10.0.0.0/16
+subnet_cidr: 10.0.1.0/24
+availability_zone: "{{ aws_region }}a"
+
+# EC2 Configuration
+instance_type: g6.2xlarge
+instance_count: 3
+ami_name: "RHEL-10*_HVM-*-x86_64-*-Hourly2-GP3"  # RHEL 10 AMI
+ami_owner: "309956199498"  # Red Hat
+key_name: "YOURKEY"  # You'll need to create this or specify your existing key
+volume_size: 100
+
+# NVIDIA Driver Configuration
+nvidia_driver_version: "580.82.07"
+nvidia_driver_package: "nvidia-open-580"
+
+# Slurm Configuration
+slurm_version: "24.05.4"  # Latest stable as of writing
+slurm_cluster_name: "gpu-cluster"
+slurm_user: slurm
+slurm_uid: 1001
+slurm_gid: 1001
+slurm_db_password: "8GAeiLXYxn7JDVWWzxnjtbFV"  # Complex password for Slurm database
+
+# Node roles (will be populated dynamically)
+slurm_controller_node: 0  # First instance will be controller
+slurm_compute_nodes: [1, 2]  # Second and third instances will be compute nodes

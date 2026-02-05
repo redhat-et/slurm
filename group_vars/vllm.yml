@@ -1,0 +1,36 @@
+---
+# vLLM Configuration
+
+vllm_install_dir: /opt/vllm
+model_cache_dir: /opt/models
+
+# Models to deploy
+# Note: g6.2xlarge has 1x L4 GPU with 24GB VRAM
+# These models are selected to fit comfortably on a single L4
+vllm_models:
+  - name: phi3
+    model_id: microsoft/Phi-3-mini-4k-instruct
+    description: "Phi-3 Mini (3.8B parameters) - Fast, efficient small model"
+    context_length: 4096
+    use_case: "Quick responses, low latency, chat"
+    gpu_memory_utilization: 0.85
+    max_model_len: 4096
+    port: 8000
+
+  - name: mistral
+    model_id: mistralai/Mistral-7B-Instruct-v0.3
+    description: "Mistral 7B Instruct - Excellent general-purpose model"
+    context_length: 32768
+    use_case: "General chat, instruction following, reasoning"
+    gpu_memory_utilization: 0.90
+    max_model_len: 8192
+    port: 8001
+
+# vLLM serving defaults
+vllm_default_dtype: "auto"
+vllm_default_tensor_parallel: 1
+vllm_default_pipeline_parallel: 1
+
+# API settings
+vllm_api_timeout: 600
+vllm_max_concurrent_requests: 256

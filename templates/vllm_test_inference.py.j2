@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""
+Test script for vLLM model serving endpoints
+Usage: python3 test_inference.py <model_name> <node_name>
+Example: python3 test_inference.py phi3 slurm-node-1
+"""
+
+import sys
+import requests
+import json
+
+def test_model_endpoint(model_name, node_name):
+    """Test a vLLM model serving endpoint"""
+
+    # Model configurations
+    models = {
+        'phi3': {'port': 8000, 'name': 'microsoft/Phi-3-mini-4k-instruct'},
+        'mistral': {'port': 8001, 'name': 'mistralai/Mistral-7B-Instruct-v0.3'},
+        'llama3': {'port': 8002, 'name': 'meta-llama/Meta-Llama-3.1-8B-Instruct'}
+    }
+
+    if model_name not in models:
+        print(f"Error: Unknown model '{model_name}'")
+        print(f"Available models: {', '.join(models.keys())}")
+        sys.exit(1)
+
+    config = models[model_name]
+    base_url = f"http://{node_name}:{config['port']}"
+
+    print(f"Testing {model_name} endpoint at {base_url}")
+    print("="*60)
+
+    # Test 1: Check available models
+    print("\n1. Checking available models...")
+    try:
+        response = requests.get(f"{base_url}/v1/models", timeout=5)
+        response.raise_for_status()
+        print(f"✓ Models endpoint responding")
+        print(json.dumps(response.json(), indent=2))
+    except Exception as e:
+        print(f"✗ Failed to connect: {e}")
+        return False
+
+    # Test 2: Completion endpoint
+    print("\n2. Testing completion endpoint...")
+    try:
+        completion_request = {
+            "model": config['name'],
+            "prompt": "Hello! Please introduce yourself in one sentence.",
+            "max_tokens": 100,
+            "temperature": 0.7
+        }
+
+        response = requests.post(
+            f"{base_url}/v1/completions",
+            json=completion_request,
+            timeout=30
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        print(f"✓ Completion successful")
+        print(f"Prompt: {completion_request['prompt']}")
+        print(f"Response: {result['choices'][0]['text']}")
+        print(f"Tokens used: {result['usage']['total_tokens']}")
+
+    except Exception as e:
+        print(f"✗ Completion failed: {e}")
+        return False
+
+    # Test 3: Chat completion endpoint
+    print("\n3. Testing chat completion endpoint...")
+    try:
+        chat_request = {
+            "model": config['name'],
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "What is the capital of France?"}
+            ],
+            "max_tokens": 50,
+            "temperature": 0.7
+        }
+
+        response = requests.post(
+            f"{base_url}/v1/chat/completions",
+            json=chat_request,
+            timeout=30
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        print(f"✓ Chat completion successful")
+        print(f"Question: {chat_request['messages'][1]['content']}")
+        print(f"Response: {result['choices'][0]['message']['content']}")
+
+    except Exception as e:
+        print(f"✗ Chat completion failed: {e}")
+        return False
+
+    print("\n" + "="*60)
+    print(f"✓ All tests passed for {model_name}!")
+    return True
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: python3 test_inference.py <model_name> <node_name>")
+        print("Example: python3 test_inference.py phi3 slurm-node-1")
+        print("\nAvailable models: phi3, mistral, llama3")
+        sys.exit(1)
+
+    model_name = sys.argv[1]
+    node_name = sys.argv[2]
+
+    success = test_model_endpoint(model_name, node_name)
+    sys.exit(0 if success else 1)
