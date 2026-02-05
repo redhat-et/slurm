@@ -12,10 +12,20 @@ The optional vLLM playbook deploys three production-ready language models optimi
 
 ## Prerequisites
 
-- Slurm cluster already deployed (`playbook.yml` completed)
+**Required Infrastructure:**
+- Slurm cluster already deployed (`playbook.yml` and `continue-slurm-install.yml` completed)
+- NVIDIA GPU instances (tested on g6.2xlarge with L4 GPUs)
+- NVIDIA drivers and CUDA toolkit installed
 - Internet connectivity on compute nodes (for downloading models)
 - ~50GB free disk space for model weights
-- HuggingFace account (optional, for gated models)
+
+**Required Files:**
+- `deploy-vllm-models.yml` - vLLM deployment playbook
+- `group_vars/vllm.yml` - Model configuration
+- `inventory/hosts` - Ansible inventory file
+
+**Optional:**
+- HuggingFace account (for gated models like Llama)
 
 ## Quick Start
 
@@ -26,11 +36,30 @@ The optional vLLM playbook deploys three production-ready language models optimi
 ansible-playbook deploy-vllm-models.yml
 ```
 
-This playbook will:
-- Install vLLM and dependencies on all nodes
-- Download model weights to compute nodes (~15-20 minutes)
-- Create Slurm job scripts for each model
-- Set up a management CLI tool
+This playbook performs three phases:
+
+**Phase 1: System-wide vLLM Installation (all nodes)**
+- Installs Python 3.12 development packages
+- Creates directories: `/opt/vllm`, `/opt/models`, `/var/log/vllm`
+- Installs vLLM 0.15.1 and dependencies (`huggingface_hub`, `accelerate`, `transformers`)
+- Configures HuggingFace cache location
+
+**Phase 2: Model Download (compute nodes only)**
+- Downloads model weights to `/opt/models/` using `snapshot_download()`
+- Models are cached in HuggingFace format:
+  ```
+  /opt/models/
+  ├── models--microsoft--Phi-3-mini-4k-instruct/
+  └── models--mistralai--Mistral-7B-Instruct-v0.3/
+  ```
+- Downloads in parallel with 4 workers, resumes interrupted downloads
+- Sets ownership to `slurm` user (~15-20 minutes total)
+
+**Phase 3: Job Script Creation (controller only)**
+- Creates `/home/slurm/vllm-jobs/` directory
+- Generates Slurm batch scripts for serving and batch inference
+- Creates `vllm-manager.sh` management CLI
+- Creates documentation files
 
 ### 2. Access the Cluster
 
@@ -52,7 +81,7 @@ sbatch serve_phi3.sh
 ### 4. Test the Model
 
 ```bash
-# Wait for job to start
+# Wait for job to start (model loading takes ~2-4 minutes)
 squeue -u $USER
 
 # Find the node where it's running
@@ -61,6 +90,47 @@ NODE=$(squeue -u $USER -h -o "%N" | head -1)
 # Test the endpoint
 python3 test_inference.py phi3 $NODE
 ```
+
+**What happens during job startup:**
+
+1. **Slurm schedules the job** - Allocates 1 GPU, 8 CPU cores, assigns to available compute node
+
+2. **Environment setup** - Sets `HF_HOME=/opt/models`, configures CUDA devices
+
+3. **Model loading phases:**
+   - Configuration loading (~5 seconds) - Reads model config, determines architecture
+   - Weight loading (~1-2 minutes) - Loads safetensors from cache, allocates GPU memory
+   - Compilation (~1-2 minutes) - torch.compile optimization, CUDA graph generation
+   - **Total startup time: 2-4 minutes** depending on model size
+
+4. **Server ready** - Binds to 0.0.0.0:port, accepts API requests
+
+**Expected resource usage (Mistral 7B):**
+- GPU Memory: ~21 GB / 23 GB (91% utilization)
+- System Memory: ~950 MB
+- Startup Time: ~4 minutes
+
+### Deployment Verification
+
+After running the deployment playbook, verify the installation:
+
+```bash
+# Check vLLM installation on all nodes
+ansible all -i inventory/hosts -m shell -a "python3 -c 'import vllm; print(vllm.__version__)'" -b
+
+# Verify model cache on compute nodes
+ansible slurm_compute -i inventory/hosts -m shell \
+  -a "ls -lh /opt/models/models--*/snapshots" -b
+
+# Verify job scripts created on controller
+ssh ec2-user@<controller-ip>
+ls -lh /home/slurm/vllm-jobs/
+```
+
+**Expected output:**
+- vLLM version: 0.15.1
+- Model directories exist in `/opt/models/`
+- Job scripts present in `/home/slurm/vllm-jobs/`
 
 ## Deployed Models
 
@@ -277,6 +347,38 @@ curl http://slurm-node-2:8001/v1/completions -d '...'  # Mistral
 
 ## API Examples
 
+### Testing Endpoints
+
+**From controller using curl:**
+```bash
+# Find the compute node running your job
+NODE=$(squeue -u $USER -h -o "%N" | head -1)
+
+# List available models
+curl -s http://$NODE:8000/v1/models | jq
+
+# Simple completion
+curl -s http://$NODE:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "microsoft/Phi-3-mini-4k-instruct",
+    "prompt": "Explain GPU computing in one sentence:",
+    "max_tokens": 100,
+    "temperature": 0.7
+  }' | jq
+```
+
+**Using Ansible from remote:**
+```bash
+# Test model endpoint
+ansible slurm_controller -i inventory/hosts -m shell \
+  -a "curl -s http://slurm-node-1:8001/v1/models" -b
+
+# Test completion
+ansible slurm_controller -i inventory/hosts -m shell \
+  -a 'curl -s http://slurm-node-1:8001/v1/completions -H "Content-Type: application/json" -d "{\"model\": \"mistralai/Mistral-7B-Instruct-v0.3\", \"prompt\": \"Hello\", \"max_tokens\": 50}"' -b
+```
+
 ### Python with OpenAI Library
 
 ```python
@@ -396,10 +498,47 @@ For larger models, use quantization:
 # Or use pre-quantized models from HuggingFace
 ```
 
+## Performance Benchmarks
+
+### Model Loading Times
+
+**Phi-3 Mini (3.8B):**
+- Configuration: ~5 seconds
+- Weight loading: ~60 seconds
+- torch.compile: ~1 minute
+- **Total startup: ~2 minutes**
+
+**Mistral 7B:**
+- Configuration: ~5 seconds
+- Weight loading: ~113 seconds
+- torch.compile: ~2 minutes
+- **Total startup: ~4 minutes**
+
+**Llama 3.1 8B:**
+- Configuration: ~5 seconds
+- Weight loading: ~120 seconds
+- torch.compile: ~2 minutes
+- **Total startup: ~4-5 minutes**
+
+### Resource Usage (on L4 GPU)
+
+| Model | GPU Memory | System Memory | Tokens/sec |
+|-------|-----------|---------------|------------|
+| Phi-3 Mini | ~8 GB | ~600 MB | 80-100 |
+| Mistral 7B | ~21 GB | ~950 MB | 40-60 |
+| Llama 3.1 8B | ~22 GB | ~1 GB | 35-55 |
+
+### Inference Latency
+
+- **First token latency:** 100-200ms
+- **Subsequent tokens:** 20-30ms each
+- **Throughput:** Varies by sequence length and batch size
+
 ## Monitoring
 
 ### GPU Utilization
 
+**Direct SSH to compute node:**
 ```bash
 # SSH to compute node
 ssh slurm-node-1
@@ -411,8 +550,30 @@ watch -n 1 nvidia-smi
 ps aux | grep vllm
 ```
 
+**Using Ansible from controller (for remote monitoring):**
+```bash
+# Check GPU status across all compute nodes
+ansible slurm_compute -i inventory/hosts -m shell \
+  -a "nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv" \
+  -b
+
+# Check vLLM processes
+ansible slurm_compute -i inventory/hosts -m shell \
+  -a "ps aux | grep vllm | grep -v grep" -b
+
+# Check specific node
+ansible slurm_compute -i inventory/hosts -m shell \
+  -a "nvidia-smi" -b --limit "slurm-node-1"
+```
+
+**Interpreting GPU metrics:**
+- `memory.used`: Model size + KV cache (e.g., 21 GB = ~13.5 GB model + ~7 GB cache)
+- `utilization.gpu`: 0% when idle, 80-100% during inference
+- `temperature`: Should stay below 80°C
+
 ### Job Logs
 
+**On controller node:**
 ```bash
 # View real-time logs
 tail -f ~/vllm-jobs/outputs/serve_phi3_*.out
@@ -422,6 +583,27 @@ grep -i "error" ~/vllm-jobs/outputs/*.err
 
 # Check model loading
 grep -i "loading" ~/vllm-jobs/outputs/serve_*.out
+```
+
+**Using Ansible from remote (logs are on compute nodes):**
+```bash
+# Check output logs on specific compute node
+ansible slurm_compute -i inventory/hosts -m shell \
+  -a "tail -100 /home/slurm/vllm-jobs/outputs/serve_mistral_*.out" \
+  -b --limit "slurm-node-1"
+
+# Check for errors
+ansible slurm_compute -i inventory/hosts -m shell \
+  -a "cat /home/slurm/vllm-jobs/outputs/serve_mistral_*.err" -b
+```
+
+**Key log indicators for successful startup:**
+```
+INFO: vLLM version 0.15.1
+INFO: Resolved architecture: MistralForCausalLM
+INFO: Loading weights took 113.27 seconds
+INFO: Model loading took 13.51 GiB memory
+INFO: Uvicorn running on http://0.0.0.0:8001
 ```
 
 ### API Metrics
@@ -474,6 +656,16 @@ EOF
    --quantization awq
    ```
 
+### Job Completes Immediately Without Loading
+
+**Symptom**: Job shows COMPLETED status in seconds, no API responding
+
+**Cause**: Gated repository requires HuggingFace authentication
+
+**Solution**:
+- Use ungated models (Phi-3, Mistral work without authentication)
+- For gated models (Llama), set HuggingFace token (see Advanced Usage)
+
 ### Job Stuck in Queue
 
 **Symptom**: Job shows PD (pending) state
@@ -485,6 +677,9 @@ squeue -u $USER -o "%.18i %.9P %.30j %.8u %.8T %.10M %.6D %R"
 
 # Check node availability
 sinfo -Nel
+
+# Check detailed job info
+sacct -j <JOB_ID> --format=JobID,JobName,State,ExitCode,Start,End,NodeList
 
 # Resume down nodes if needed
 sudo scontrol update nodename=slurm-node-1 state=resume
