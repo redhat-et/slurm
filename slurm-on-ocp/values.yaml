@@ -23,6 +23,14 @@ loginsets:
         tag: 25.11-centos9-ohpc
       securityContext:
         privileged: true
+      volumeMounts:
+        - name: shared-home
+          mountPath: /home
+    podSpec:
+      volumes:
+        - name: shared-home
+          persistentVolumeClaim:
+            claimName: shared-home
 nodesets:
   slinky:
     replicas: 1
@@ -35,6 +43,14 @@ nodesets:
           nvidia.com/gpu: 1
         requests:
           nvidia.com/gpu: 1
+      volumeMounts:
+        - name: shared-home
+          mountPath: /home
+    podSpec:
+      volumes:
+        - name: shared-home
+          persistentVolumeClaim:
+            claimName: shared-home
 restapi:
   slurmrestd:
     image:

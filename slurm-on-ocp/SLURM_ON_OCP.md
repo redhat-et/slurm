@@ -26,7 +26,7 @@ oc adm policy add-scc-to-user privileged -n slurm -z default
 
 ### 3. Deploy Slurm Instance
 
-Create a `values.yaml` with custom image references and GPU configuration, see [values.yaml](/values.yaml) for reference.
+Create a `values.yaml` with custom image references and GPU configuration, see [values.yaml](./values.yaml) for reference.
 
 Deploy using Helm:
 
