@@ -24,6 +24,14 @@ oc adm new-project slurm
 oc adm policy add-scc-to-user privileged -n slurm -z default
 ```
 
+### 4. Create a shared home RWX PVC
+
+You need to have RWX capabilities in your cluster. In our case we solved it by adding EFS provisioner.
+
+```bash
+oc apply -n slurm -f pvc.yaml
+```
+
 ### 3. Deploy Slurm Instance
 
 Create a `values.yaml` with custom image references and GPU configuration, see [values.yaml](./values.yaml) for reference.

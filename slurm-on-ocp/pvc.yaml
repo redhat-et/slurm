@@ -3,9 +3,9 @@ kind: PersistentVolumeClaim
 metadata:
   name: shared-home
 spec:
+  storageClassName: efs-sc
   accessModes:
     - ReadWriteMany
   resources:
     requests:
       storage: 1Gi
-  volumeMode: Filesystem
