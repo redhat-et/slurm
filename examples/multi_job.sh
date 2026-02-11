@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=multi_job
-#SBATCH --output=multi_job_%j_%a.out
-#SBATCH --error=multi_job_%j_%a.err
+#SBATCH --output=/home/%u/outputs/multi_job_%j_%a.out
+#SBATCH --error=/home/%u/outputs/multi_job_%j_%a.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --gres=gpu:1

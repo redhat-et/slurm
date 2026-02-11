@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=test_gpu
-#SBATCH --output=test_gpu_%j.out
-#SBATCH --error=test_gpu_%j.err
+#SBATCH --output=/home/%u/outputs/test_gpu_%j.out
+#SBATCH --error=/home/%u/outputs/test_gpu_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --gres=gpu:1

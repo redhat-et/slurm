@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=compare-models
-#SBATCH --output=outputs/compare_models_%j.out
-#SBATCH --error=outputs/compare_models_%j.err
+#SBATCH --output=/home/%u/outputs/compare_models_%j.out
+#SBATCH --error=/home/%u/outputs/compare_models_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1

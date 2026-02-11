@@ -4,7 +4,8 @@ accounting:
       repository: quay.io/slinky-on-openshift/slurmdbd
       tag: 25.11-centos9-ohpc
 configFiles:
-  gres.conf: AutoDetect=nvidia
+  gres.conf: |
+    AutoDetect=nvidia
 controller:
   reconfigure:
     image:
@@ -34,6 +35,7 @@ loginsets:
 nodesets:
   slinky:
     replicas: 1
+    extraConf: Gres=gpu:1
     slurmd:
       image:
         repository: quay.io/slinky-on-openshift/slurmd-cuda

@@ -93,6 +93,34 @@ Fri Feb  6 11:07:25 2026
 +-----------------------------------------------------------------------------------------+
 ```
 
+## Verify shared home directory
+
+Shared home directory is quite useful since Slurm collects job `stdout`/`stderr` output into files and stores them in the user home directory.
+
+```bash
+$ findmnt /home
+TARGET SOURCE      FSTYPE OPTIONS
+/home  127.0.0.1:/ nfs4   rw,relatime,vers=4.1,rsize=1048576,wsize=1048576,namlen=255,hard,noresvport,proto=tcp,port=20308,timeo=600,retrans=2,sec=sys,clientadd
+```
+
+## Prepare vLLM environment
+
+```
+$ srun --gres gpu=1 dnf install python3 python3-pip python3-devel
+```
+
+## Create user account
+
+```bash
+# Run on slurm cluster
+$ useradd user1
+$ cp -r /root/.ssh /home/user1/
+$ exit
+
+# Now log in as this new user1 over ssh
+$ ssh -o ProxyCommand='oc exec -i -n slurm svc/%h -- socat STDIO TCP:localhost:22' user1@slurm-login-slinky
+```
+
 ## Key Configuration Notes
 
 - **GPU Auto-Detection**: `gres.conf: AutoDetect=nvidia` enables automatic GPU discovery

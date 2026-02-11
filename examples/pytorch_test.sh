@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=pytorch_test
-#SBATCH --output=pytorch_test_%j.out
-#SBATCH --error=pytorch_test_%j.err
+#SBATCH --output=/home/%u/outputs/pytorch_test_%j.out
+#SBATCH --error=/home/%u/outputs/pytorch_test_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
